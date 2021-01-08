@@ -5,6 +5,11 @@
  * them to different devices.
  *
  * This file is released under the GPL.
+ *
+ *
+ * ddi - Disk Delay Injection
+ * A DM driver which injects delay in block device I/O, allowing dynamic parameter control.
+ * Based on dm-delay from the kernel upstream.
  */
 
 #include <linux/module.h>
@@ -15,7 +20,7 @@
 
 #include <linux/device-mapper.h>
 
-#define DM_MSG_PREFIX "delay"
+#define DM_MSG_PREFIX "ddi"
 
 struct delay_c {
 	struct timer_list delay_timer;
@@ -34,6 +39,10 @@ struct delay_c {
 	sector_t start_write;
 	unsigned write_delay;
 	unsigned writes;
+
+	struct kobject *kobj;
+	struct kobj_attribute read_delay_attr;
+	struct kobj_attribute write_delay_attr;
 };
 
 struct dm_delay_info {
@@ -43,6 +52,103 @@ struct dm_delay_info {
 };
 
 static DEFINE_MUTEX(delayed_bios_lock);
+
+/* Sysfs implementation for dynamic parameter control.*/
+static struct kobject *ddi_kobj;
+
+static ssize_t show_delay(unsigned delay, char *buf)
+{
+	/* The buffer allocation size is PAGE_SIZE(=4k typically) so it is safe to print an int
+	 * without limiting length.
+	 * ref: https://www.kernel.org/doc/Documentation/filesystems/sysfs.txt
+	 */
+	return sprintf(buf, "%u\n", delay);
+}
+
+static void queue_timeout(struct delay_c *dc, unsigned long expires);
+
+static ssize_t store_delay(struct delay_c *dc, unsigned *delay, const char *buf, size_t count)
+{
+	unsigned new_delay;
+	unsigned long expires;
+
+	/* buf is null-terminated. */
+	sscanf(buf, "%d", &new_delay);
+	if (new_delay < 0) {
+		printk(KERN_WARNING "Not setting an invalid delay: %d\n", new_delay);
+		return count;
+	}
+
+	printk(KERN_DEBUG "Updating delay %u => %u\n", *delay, new_delay);
+	*delay = new_delay;
+	smp_wmb();
+
+	/* Update timer to cancel possibly existing too long timeout. */
+	expires = jiffies + msecs_to_jiffies(new_delay);
+	queue_timeout(dc, expires);
+
+	return count;
+}
+
+static ssize_t read_delay_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct delay_c *dc = container_of(attr, struct delay_c, read_delay_attr);
+	return show_delay(dc->read_delay, buf);
+}
+
+static ssize_t read_delay_store(struct kobject *kobj, struct kobj_attribute *attr,
+								const char *buf, size_t count)
+{
+	struct delay_c *dc = container_of(attr, struct delay_c, read_delay_attr);
+	return store_delay(dc, &dc->read_delay, buf, count);
+}
+
+static ssize_t write_delay_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct delay_c *dc = container_of(attr, struct delay_c, write_delay_attr);
+	return show_delay(dc->write_delay, buf);
+}
+
+static ssize_t write_delay_store(struct kobject *kobj, struct kobj_attribute *attr,
+								 const char *buf, size_t count)
+{
+	struct delay_c *dc = container_of(attr, struct delay_c, write_delay_attr);
+	if (!dc->dev_write) {
+		printk(KERN_WARNING "Write device is not configured\n");
+		return count;
+	}
+	return store_delay(dc, &dc->write_delay, buf, count);
+}
+
+static int init_dev_kobject(struct delay_c *dc)
+{
+	int ret = 0;
+	static struct attribute *attrs[3];
+	static struct attribute_group attr_group = { .attrs = attrs };
+	attrs[0] = &dc->read_delay_attr.attr;
+	attrs[1] = &dc->write_delay_attr.attr;
+	attrs[2] = NULL;
+
+	dc->kobj = kobject_create_and_add(dc->dev_read->name, ddi_kobj);
+	if (!dc->kobj)
+		return -ENOMEM;
+
+	dc->read_delay_attr = (struct kobj_attribute)__ATTR(read_delay, 0666, read_delay_show, read_delay_store);
+	dc->write_delay_attr = (struct kobj_attribute)__ATTR(write_delay, 0666, write_delay_show, write_delay_store);
+
+	ret = sysfs_create_group(dc->kobj, &attr_group);
+	if (ret)
+		kobject_put(dc->kobj);
+
+	return ret;
+}
+
+static void destroy_dev_kobject(struct delay_c *dc)
+{
+	kobject_put(dc->kobj);
+}
+
+/* Device Mapper implementation. */
 
 static void handle_delayed_timer(unsigned long data)
 {
@@ -189,7 +295,7 @@ static int delay_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 out:
 	ret = -EINVAL;
-	dc->kdelayd_wq = alloc_workqueue("kdelayd", WQ_MEM_RECLAIM, 0);
+	dc->kdelayd_wq = alloc_workqueue("kddid", WQ_MEM_RECLAIM, 0);
 	if (!dc->kdelayd_wq) {
 		DMERR("Couldn't start kdelayd");
 		goto bad_queue;
@@ -206,8 +312,17 @@ out:
 	ti->num_discard_bios = 1;
 	ti->per_io_data_size = sizeof(struct dm_delay_info);
 	ti->private = dc;
+
+	ret = init_dev_kobject(dc);
+	if (ret) {
+		DMERR("Failed to setup sysfs");
+		goto bad_sysfs;
+	}
+
 	return 0;
 
+bad_sysfs:
+	destroy_workqueue(dc->kdelayd_wq);
 bad_queue:
 	if (dc->dev_write)
 		dm_put_device(ti, dc->dev_write);
@@ -221,6 +336,8 @@ bad:
 static void delay_dtr(struct dm_target *ti)
 {
 	struct delay_c *dc = ti->private;
+
+	destroy_dev_kobject(dc);
 
 	if (dc->kdelayd_wq)
 		destroy_workqueue(dc->kdelayd_wq);
@@ -338,7 +455,7 @@ out:
 }
 
 static struct target_type delay_target = {
-	.name	     = "delay",
+	.name	     = "ddi",
 	.version     = {1, 2, 1},
 	.module      = THIS_MODULE,
 	.ctr	     = delay_ctr,
@@ -360,6 +477,10 @@ static int __init dm_delay_init(void)
 		goto bad_register;
 	}
 
+	ddi_kobj = kobject_create_and_add("ddi", fs_kobj);
+	if (!ddi_kobj)
+		return -ENOMEM;
+
 	return 0;
 
 bad_register:
@@ -368,6 +489,7 @@ bad_register:
 
 static void __exit dm_delay_exit(void)
 {
+	kobject_put(ddi_kobj);
 	dm_unregister_target(&delay_target);
 }
 
