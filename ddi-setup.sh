@@ -106,11 +106,11 @@ function do_create() {
         dev_path="$lo_dev"
     fi
 
-    echo "Setting up dm-ddi for $lo_dev" >&2
-    echo "0 `/sbin/blockdev --getsz $lo_dev` ddi $lo_dev 0 0 $lo_dev 0 0" | /sbin/dmsetup create "$dev_name"
+    echo "Setting up dm-ddi for $dev_path" >&2
+    echo "0 `/sbin/blockdev --getsz $dev_path` ddi $dev_path 0 0 $dev_path 0 0" | /sbin/dmsetup create "$dev_name"
 
     if [ $skip_mount = 0 ]; then
-        echo "Mounting $lo_dev to $mountpoint" >&2
+        echo "Mounting $dev_path to $mountpoint" >&2
         mount "/dev/mapper/$dev_name" "$mountpoint"
         echo "Device is ready at $mountpoint" >&2
     else
