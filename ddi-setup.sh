@@ -14,6 +14,7 @@ Options:
   -h - Show this help
   -u - Skip mounting created device and print its path instead
   -d - The target device instead of mapping a file as a loopback device
+  -D - Directory to create a virtual device file. (default: /tmp)
   -m - The file path to use as a virtual device by mapping it to a loopback device (default: a file under /tmp)
   -s - Size to allocate for the virtual (file-based) device, in KiB (default: 100240 (100MiB))
   -t - Filesystem to provision for the target device. This program calls mkfs.\$ARGS with no argument (default: xfs)
@@ -28,11 +29,12 @@ function module_loaded() {
 
 skip_mount=0
 dev_path=""
+vdisk_dir="/tmp"
 vdisk_path=""
 vdisk_size=100240
 fs_type="xfs"
 
-while getopts "hud:m:s:t:" opt; do
+while getopts "hud:D:m:s:t:" opt; do
     case "$opt" in
         h)  show_help
             exit 0
@@ -40,6 +42,8 @@ while getopts "hud:m:s:t:" opt; do
         u)  skip_mount=1
             ;;
         d)  dev_path=$OPTARG
+            ;;
+        D)  vdisk_dir=$OPTARG
             ;;
         m)  vdisk_path=$OPTARG
             ;;
@@ -84,7 +88,7 @@ function do_create() {
     if [ -z "$dev_path" ]; then
         mkfs=0
         if [ -z "$vdisk_path" ]; then
-            vdisk_path=$(mktemp /tmp/ddi-vdisk-XXXXX)
+            vdisk_path=$(mktemp "$vdisk_dir/ddi-vdisk-XXXXX")
             echo "Creating a virtual disk as a file: $vdisk_path" >&2
             dd if=/dev/zero of="$vdisk_path" bs=1024 count="$vdisk_size" >/dev/null
             mkfs=1
