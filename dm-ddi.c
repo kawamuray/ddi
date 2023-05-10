@@ -13,6 +13,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
@@ -133,8 +134,8 @@ static int init_dev_kobject(struct delay_c *dc)
 	if (!dc->kobj)
 		return -ENOMEM;
 
-	dc->read_delay_attr = (struct kobj_attribute)__ATTR(read_delay, 0666, read_delay_show, read_delay_store);
-	dc->write_delay_attr = (struct kobj_attribute)__ATTR(write_delay, 0666, write_delay_show, write_delay_store);
+	dc->read_delay_attr = (struct kobj_attribute)__ATTR(read_delay, 0644, read_delay_show, read_delay_store);
+	dc->write_delay_attr = (struct kobj_attribute)__ATTR(write_delay, 0644, write_delay_show, write_delay_store);
 
 	ret = sysfs_create_group(dc->kobj, &attr_group);
 	if (ret)
@@ -150,9 +151,15 @@ static void destroy_dev_kobject(struct delay_c *dc)
 
 /* Device Mapper implementation. */
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 static void handle_delayed_timer(unsigned long data)
-{
+p{
 	struct delay_c *dc = (struct delay_c *)data;
+#else
+static void handle_delayed_timer(struct timer_list *t)
+{
+	struct delay_c *dc = from_timer(dc, t, delay_timer);
+#endif
 
 	queue_work(dc->kdelayd_wq, &dc->flush_expired_bios);
 }
@@ -301,7 +308,11 @@ out:
 		goto bad_queue;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 	setup_timer(&dc->delay_timer, handle_delayed_timer, (unsigned long)dc);
+#else
+	timer_setup(&dc->delay_timer, handle_delayed_timer, 0);
+#endif
 
 	INIT_WORK(&dc->flush_expired_bios, flush_expired_bios);
 	INIT_LIST_HEAD(&dc->delayed_bios);
@@ -398,20 +409,42 @@ static void delay_resume(struct dm_target *ti)
 static int delay_map(struct dm_target *ti, struct bio *bio)
 {
 	struct delay_c *dc = ti->private;
+	int delay;
+	struct block_device *bdev;
+	sector_t sector;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
+	sector = bio->bi_sector;
+#else
+	sector = bio->bi_iter.bi_sector;
+#endif
 
 	if ((bio_data_dir(bio) == WRITE) && (dc->dev_write)) {
-		bio->bi_bdev = dc->dev_write->bdev;
-		if (bio_sectors(bio))
-			bio->bi_sector = dc->start_write +
-					 dm_target_offset(ti, bio->bi_sector);
-
-		return delay_bio(dc, dc->write_delay, bio);
+		delay = dc->write_delay;
+		bdev = dc->dev_write->bdev;
+		sector = dc->start_write + dm_target_offset(ti, sector);
+	} else {
+		delay = dc->read_delay;
+		bdev = dc->dev_read->bdev;
+		sector = dc->start_read + dm_target_offset(ti, sector);
 	}
 
-	bio->bi_bdev = dc->dev_read->bdev;
-	bio->bi_sector = dc->start_read + dm_target_offset(ti, bio->bi_sector);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
+	bio->bi_bdev = bdev;
+#else
+	bio_set_dev(bio, bdev);
+#endif
 
-	return delay_bio(dc, dc->read_delay, bio);
+	if (bio_sectors(bio)) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
+		bio->bi_sector = sector;
+#else
+		bio->bi_iter.bi_sector = sector;
+#endif
+	}
+
+
+	return delay_bio(dc, delay, bio);
 }
 
 static void delay_status(struct dm_target *ti, status_type_t type,
