@@ -153,7 +153,7 @@ static void destroy_dev_kobject(struct delay_c *dc)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 static void handle_delayed_timer(unsigned long data)
-p{
+{
 	struct delay_c *dc = (struct delay_c *)data;
 #else
 static void handle_delayed_timer(struct timer_list *t)
