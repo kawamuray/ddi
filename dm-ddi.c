@@ -181,7 +181,12 @@ static void flush_bios(struct bio *bio)
 	while (bio) {
 		n = bio->bi_next;
 		bio->bi_next = NULL;
+// https://github.com/torvalds/linux/commit/ed00aabd5eb9fb44d6aff1173234a2e911b9fead
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,9,0)
 		generic_make_request(bio);
+#else
+		submit_bio_noacct(bio);
+#endif
 		bio = n;
 	}
 }
